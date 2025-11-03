@@ -5,11 +5,14 @@
 //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~//
 
 // rover includes
-#include "ray_generators/vtkm_ray_generator.hpp"
+#include <logging/ascent_annotations.hpp>
+#include "ray_generators/ray_generator.hpp"
 #include "settings.hpp"
 #include "vtkm_typedefs.hpp"
 #include <algorithm>
 #include <typed_scheduler.hpp>
+#include <ascent_logging.hpp>
+
 
 using namespace conduit;
 
@@ -23,6 +26,7 @@ TypedScheduler<FloatType>::TypedScheduler()
   // a new scheduler, since we already instantiate it beforehand
   m_ray_generator = nullptr;
   m_num_local_domains = 0;
+  m_has_emission = rover::settings.has_child("emission");
 }
 
 #ifdef ROVER_PARALLEL
@@ -56,21 +60,28 @@ TypedScheduler<FloatType>::set_ray_generator(RayGenerator *ray_generator)
 
 template<typename FloatType>
 void
-TypedScheduler<FloatType>::create_background(const int num_channels)
+TypedScheduler<FloatType>::create_background(const int num_energy_groups)
 {
   // Initialize background intensities to 0.0f (by default)
   const float64 background_intensity = rover::settings["background_intensity"].to_float64();
-  m_background.resize(num_channels, background_intensity);
+  m_background.resize(num_energy_groups, background_intensity);
 }
 
 template<typename FloatType>
 int
-TypedScheduler<FloatType>::get_global_channels()
+TypedScheduler<FloatType>::get_global_num_energy_groups()
 {
-  int num_channels = 1;
+  int num_energy_groups = 1;
+  int has_field_mismatch = 0;
+
   for (auto& domain : m_domains)
   {
-    num_channels = std::max(num_channels, domain.get_num_channels());
+    num_energy_groups = std::max(num_energy_groups, domain.get_num_energy_groups());
+    // Check if this domain had a field mismatch
+    if (domain.get_field_mismatch_error())
+    {
+      has_field_mismatch = 1;
+    }
   }
 
 #ifdef ROVER_PARALLEL
@@ -78,15 +89,39 @@ TypedScheduler<FloatType>::get_global_channels()
   timer.Start();
   double time = 0;
   (void) time;
-  int mpi_num_channels;
-  MPI_Allreduce(&num_channels, &mpi_num_channels, 1, MPI_INT, MPI_MAX, m_comm_handle);
-  num_channels = mpi_num_channels;
+  int mpi_min_energy_groups;
+  int mpi_max_energy_groups;
+  MPI_Allreduce(&num_energy_groups, &mpi_min_energy_groups, 1, MPI_INT, MPI_MIN, m_comm_handle);
+  MPI_Allreduce(&num_energy_groups, &mpi_max_energy_groups, 1, MPI_INT, MPI_MAX, m_comm_handle);
+
+  // Check that all ranks have the same num_energy_groups
+  if (mpi_min_energy_groups != mpi_max_energy_groups)
+  {
+    ASCENT_LOG_ERROR("Error - TypedScheduler::get_global_num_energy_groups: MPI ranks have inconsistent number of energy groups. "
+                "Local: " << num_energy_groups << ", Global min: " << mpi_min_energy_groups << ", Global max: " << mpi_max_energy_groups);
+  }
+
+  // Check that all ranks agree on field mismatch state
+  int global_field_mismatch = 0;
+  MPI_Allreduce(&has_field_mismatch, &global_field_mismatch, 1, MPI_INT, MPI_MAX, m_comm_handle);
+  if (global_field_mismatch)
+  {
+    ASCENT_LOG_ERROR("Error - TypedScheduler::get_global_num_energy_groups: "
+                     "mismatched nunmber of absorption and emission fields detected on one or more ranks");
+  }
+
   time = timer.GetElapsedTime();
-  ROVER_DATA_ADD("get_global_channels_all_reduce", time);
+  ROVER_DATA_ADD("get_global_num_energy_groups_all_reduce", time);
+#else
+  if (has_field_mismatch)
+  {
+    ASCENT_LOG_ERROR("Error - TypedScheduler::get_global_num_energy_groups: "
+                     "mismatched number of absorption and emission fields");
+  }
 #endif
 
-  ROVER_INFO("Global number of channels" << num_channels);
-  return num_channels;
+  ROVER_INFO("Global number of energy groups" << num_energy_groups);
+  return num_energy_groups;
 }
 
 template<typename FloatType>
@@ -215,12 +250,11 @@ void
 TypedScheduler<FloatType>::composite()
 {
   // TODO: Combine AbsorptionPartial and EmissionPartial
-  const std::string emission = rover::settings["emission"].as_string();
-  if (!emission.empty())
+  if (m_has_emission)
   {
     typed_composite<vtkh::EmissionPartial<FloatType>>();
   }
-  else // (emission.empty())
+  else // (!m_has_emission)
   {
     typed_composite<vtkh::AbsorptionPartial<FloatType>>();
   }
@@ -246,6 +280,9 @@ TypedScheduler<FloatType>::typed_composite()
   const int num_partials = m_partial_images.size();
   std::vector<std::vector<PartialType>> partials(num_partials);
 
+#ifdef ROVER_OPENMP_ENABLED
+  #pragma omp parallel for
+#endif
   for (int i = 0; i < num_partials; ++i)
   {
     m_partial_images[i].extract_partials(partials[i]);
@@ -275,6 +312,10 @@ TypedScheduler<FloatType>::typed_composite()
     int height = m_partial_images[0].m_height;
     std::vector<std::vector<vtkh::VolumePartial<FloatType>>> partials;
     partials.resize(num_partials);
+    
+#ifdef ROVER_OPENMP_ENABLED
+    #pragma omp parallel for
+#endif
     for (int i = 0; i < num_partials; ++i)
     {
       m_partial_images[i].extract_partials(partials[i]);
@@ -303,12 +344,15 @@ template<typename FloatType>
 void
 TypedScheduler<FloatType>::trace_rays()
 {
+  ASCENT_ANNOTATE_MARK_SCOPE("rover trace rays");
+
   ROVER_INFO("Executing TypedScheduler::trace_rays");
   vtkmTimer tot_timer;
   vtkmTimer timer;
   tot_timer.Start();
   timer.Start();
   double time = 0.0;
+
   ROVER_DATA_OPEN("schedule_trace");
 
   if (!m_ray_generator)
@@ -316,20 +360,11 @@ TypedScheduler<FloatType>::trace_rays()
     throw RoverException("Error: ray generator must be set before execute is called");
   }
 
-  m_ray_generator->reset();
-
   set_global_range_and_bounds();
 
   vtkmTimer trace_timer;
   trace_timer.Start();
 
-  // TODO: Don't love that we need dynamic_cast
-  // TODO: Actually support both cases, vtkm and visit. Add tests
-  auto *cast_ray_generator = dynamic_cast<VtkmRayGenerator*>(m_ray_generator);
-  if (!cast_ray_generator)
-  {
-    throw RoverException("Error: RayGenerator instance must be a CameraGenerator");
-  }
   vtkmRayTracing::Ray<FloatType> rays;
 
   for (int i = 0; i < m_num_local_domains; i++)
@@ -343,17 +378,27 @@ TypedScheduler<FloatType>::trace_rays()
     vtkmLogger::GetInstance()->Clear();
 
     // Setting the coordinate system miminizes the number of rays generated
-    cast_ray_generator->set_coordinates(m_domains[i].get_dataset().GetCoordinateSystem());
+    m_ray_generator->set_coordinates(m_domains[i].get_dataset().GetCoordinateSystem());
     ROVER_INFO("Generating rays for domian " << i);
 
     timer.Start();
 
-    cast_ray_generator->get_rays(rays);
+    ASCENT_ANNOTATE_MARK_BEGIN("rover setup rays for domain");
+    // TODO: I'm curious about which conditions can cause rays to fail to be created
+    if (!m_ray_generator->get_rays(rays))
+    {
+      ASCENT_LOG_ERROR("Failed to create new rays");
+    }
+
     ROVER_INFO("Generated " << rays.NumRays << " rays");
     m_domains[i].init_rays(rays);
 
     time = timer.GetElapsedTime();
     ROVER_DATA_ADD("m_domains_init_rays", time);
+
+    ASCENT_ANNOTATE_MARK_END("rover setup rays for domain");
+
+    ASCENT_ANNOTATE_MARK_BEGIN("rover trace rays for domain");
     ROVER_INFO("Tracing domain " << i);
 
     timer.Start();
@@ -361,6 +406,8 @@ TypedScheduler<FloatType>::trace_rays()
     m_domains[i].partial_trace(rays, partials);
     time = timer.GetElapsedTime();
     ROVER_DATA_ADD("domain_trace", time);
+
+    ASCENT_ANNOTATE_MARK_END("rover trace rays for domain");
 
 #ifdef ROVER_ENABLE_LOGGING
     DataLogger::GetInstance()->GetStream()<<vtkmLogger::GetInstance()->GetStream().str();
@@ -386,7 +433,7 @@ TypedScheduler<FloatType>::trace_rays()
   timer.Start();
   time = trace_timer.GetElapsedTime();
   ROVER_DATA_ADD("total_trace", time);
-  int num_channels = get_global_channels();
+  int num_energy_groups = get_global_num_energy_groups();
 
   vtkmTimer t1;
   t1.Start();
@@ -395,15 +442,14 @@ TypedScheduler<FloatType>::trace_rays()
   if (m_num_local_domains == 0 || m_partial_images.empty())
   {
     PartialImage<FloatType> partial_image;
-    partial_image.m_transmission =
-      vtkmRayTracing::ChannelBuffer<FloatType>(num_channels, 0);
+    partial_image.m_transmission = vtkmRayTracing::ChannelBuffer<FloatType>(num_energy_groups, 0);
 
-    const std::string emission = rover::settings["emission"].as_string();
-    if (!emission.empty())
+    // Add an intensity buffer if the emission field is set
+    if (m_has_emission)
     {
-      partial_image.m_intensity =
-        vtkmRayTracing::ChannelBuffer<FloatType>(num_channels, 0);
+      partial_image.m_intensity = vtkmRayTracing::ChannelBuffer<FloatType>(num_energy_groups, 0);
     }
+
     m_partial_images.push_back(partial_image);
   }
 
@@ -412,7 +458,7 @@ TypedScheduler<FloatType>::trace_rays()
 
   if (m_background.empty())
   {
-    create_background(num_channels);
+    create_background(num_energy_groups);
   }
 
   ROVER_DATA_ADD("default_bg", t1.GetElapsedTime());
@@ -423,9 +469,11 @@ TypedScheduler<FloatType>::trace_rays()
   timer.Start();
 
   // Composite the results
+  ASCENT_ANNOTATE_MARK_BEGIN("rover composite");
   timer.Start();
   composite();
   time = timer.GetElapsedTime();
+  ASCENT_ANNOTATE_MARK_END("rover composite");
   ROVER_DATA_ADD("compositing", time);
   timer.Start();
 
@@ -467,9 +515,9 @@ void TypedScheduler<FloatType>::save_png(std::string filename)
   // if (m_render_settings.m_render_mode == energy) // removing volume renderer
   // {
 
-  const int num_channels = m_result.get_num_channels();
-  ROVER_INFO("Saving " << num_channels << " channels");
-  for (int i = 0; i < num_channels; ++i)
+  const int num_energy_groups = m_result.get_num_energy_groups();
+  ROVER_INFO("Saving " << num_energy_groups << " energy groups");
+  for (int i = 0; i < num_energy_groups; ++i)
   {
     std::stringstream sstream;
     sstream << filename << "_" << i << ".png";
@@ -518,10 +566,10 @@ void TypedScheduler<FloatType>::save_bov(std::string file_name)
   // if (m_render_settings.m_render_mode == energy) // removing volume renderer
   // {
     
-  const int num_channels = m_result.get_num_channels();
-  ROVER_INFO("Saving bov with " << num_channels << " channels");
+  const int num_energy_groups = m_result.get_num_energy_groups();
+  ROVER_INFO("Saving bov with " << num_energy_groups << " energy groups");
 
-  for (int i = 0; i < num_channels; ++i)
+  for (int i = 0; i < num_energy_groups; i++)
   {
     std::stringstream sstream;
     sstream << file_name  << "_" << i << ".bov";
@@ -743,6 +791,9 @@ TypedScheduler<FloatType>::write_blueprint_rays_mesh(Node &data_out,
       scaled_unit_left = dx * vtkm::Normal(left);
       scaled_unit_up = dy * vtkm::Normal(up);
 
+#ifdef ROVER_OPENMP_ENABLED
+      #pragma omp parallel for collapse(2)
+#endif
       for (int j = 0; j < image_width; j++)
       {
           for (int k = 0; k < image_height; k++)
@@ -791,11 +842,13 @@ template<typename FloatType>
 void
 TypedScheduler<FloatType>::to_blueprint(Node &data)
 {
+  ASCENT_ANNOTATE_MARK_SCOPE("rover ray trace results to blueprint");
+
   const int64 image_width = rover::settings["width"].to_int64();
   const int64 image_height = rover::settings["height"].to_int64();
   const double aspect_ratio = static_cast<double>(image_width) / static_cast<double>(image_height);
 
-  const int num_channels = m_result.get_num_channels();
+  const int num_energy_groups = m_result.get_num_energy_groups();
 
   vtkmCamera camera = m_ray_generator->get_camera();
   const vtkmVec3f position = camera.GetPosition();
@@ -888,13 +941,11 @@ TypedScheduler<FloatType>::to_blueprint(Node &data)
   xray_view["far_plane"] = far_plane;
 
   Node &xray_query = state["xray_query"];
-  xray_query.set(rover::settings);
+  xray_query.update(rover::settings);
 
   Node &xray_data = state["xray_data"];
   xray_data["detector_width"] = detector_width; // TODO: Needs validation against VisIt
   xray_data["detector_height"] = detector_height; // TODO: Needs validation against VisIt
-  xray_data["intensity_max"];
-  xray_data["intensity_min"];
   xray_data["optical_depth_max"];
   xray_data["optical_depth_min"];
   xray_data["image_topo_order_of_domain_variables"] = "xyz";
@@ -911,7 +962,7 @@ TypedScheduler<FloatType>::to_blueprint(Node &data)
 
   image_coords["values/x"].set(DataType::float64(image_width + 1));
   image_coords["values/y"].set(DataType::float64(image_height + 1));
-  image_coords["values/z"].set(DataType::float64(num_channels + 1));
+  image_coords["values/z"].set(DataType::float64(num_energy_groups + 1));
 
   float64_array image_coords_x = image_coords["values/x"].value();
   float64_array image_coords_y = image_coords["values/y"].value();
@@ -927,7 +978,7 @@ TypedScheduler<FloatType>::to_blueprint(Node &data)
     image_coords_y[i] = i;
   }
 
-  for (int i = 0; i <= num_channels; i++)
+  for (int i = 0; i <= num_energy_groups; i++)
   {
     image_coords_z[i] = i;
   }
@@ -940,39 +991,12 @@ TypedScheduler<FloatType>::to_blueprint(Node &data)
   image_coords["units/y"] = "pixels";
   image_coords["units/z"] = "bins";
 
-  // if (m_render_settings.m_render_mode == energy) // removing volume renderer
-  // {
-
   // Topology
   Node &image_topo = topologies["image_topo"];
   image_topo["coordset"] = "image_coords";
   image_topo["type"] = "rectilinear";
 
-  if (!m_result.has_intensity(0) || !m_result.has_optical_depth(0))
-  {
-    ROVER_ERROR("intensity and optical depth must both be available")
-  }
-
-  // Fields
-  Node &intensities = fields["intensities"];
-  intensities["topology"] = "image_topo";
-  intensities["association"] = "element";
-  intensities["units"] = "intensity units";
-  vtkm::cont::ArrayHandle<FloatType> intensity_values = m_result.flatten_intensity_values();
-  FloatType *intensity_buffer = get_vtkm_ptr(intensity_values);
-  const int num_intensity_values = intensity_values.GetNumberOfValues();
-
-  auto intensity_min_max = std::minmax_element(intensity_buffer, intensity_buffer + num_intensity_values);
-  xray_data["intensity_max"].set(intensity_min_max.second);
-  xray_data["intensity_min"].set(intensity_min_max.first);
-  
-  intensities["values"].set(intensity_buffer, num_intensity_values);
-  intensities["strides"].set(DataType::int64(3));
-  int64_array strides = intensities["strides"].value();
-  strides[0] = 1;
-  strides[1] = image_width;
-  strides[2] = image_width * image_height;
-
+  // Image field
   Node &optical_depth = fields["optical_depth"];
   optical_depth["topology"] = "image_topo";
   optical_depth["association"] = "element";
@@ -986,7 +1010,44 @@ TypedScheduler<FloatType>::to_blueprint(Node &data)
   xray_data["optical_depth_min"].set(optical_min_max.first);
 
   optical_depth["values"].set(optical_buffer, num_optical_values);
-  optical_depth["strides"].set(intensities["strides"]);
+  optical_depth["strides"].set(DataType::int64(3));
+  int64_array strides = optical_depth["strides"].value();
+  strides[0] = 1;
+  strides[1] = image_width;
+  strides[2] = image_width * image_height;
+
+  // Spatial field
+  Node &optical_depth_spatial = fields["optical_depth_spatial"];
+  optical_depth_spatial.set(optical_depth);
+  optical_depth_spatial["topology"] = "spatial_topo";
+
+  // We only populate the intensities fields if the emission field was set
+  if (m_has_emission)
+  {
+    xray_data["intensity_max"];
+    xray_data["intensity_min"];
+
+    // Image field
+    Node &intensities = fields["intensities"];
+    intensities["topology"] = "image_topo";
+    intensities["association"] = "element";
+    intensities["units"] = "intensity units";
+    vtkm::cont::ArrayHandle<FloatType> intensity_values = m_result.flatten_intensity_values();
+    FloatType *intensity_buffer = get_vtkm_ptr(intensity_values);
+    const int num_intensity_values = intensity_values.GetNumberOfValues();
+  
+    auto intensity_min_max = std::minmax_element(intensity_buffer, intensity_buffer + num_intensity_values);
+    xray_data["intensity_max"].set(intensity_min_max.second);
+    xray_data["intensity_min"].set(intensity_min_max.first);
+    
+    intensities["values"].set(intensity_buffer, num_intensity_values);
+    intensities["strides"].set(strides);
+
+    // Spatial field
+    Node &intensities_spatial = fields["intensities_spatial"];
+    intensities_spatial.set(intensities);
+    intensities_spatial["topology"] = "spatial_topo";
+  }
 
   //
   // Spatial mesh
@@ -997,7 +1058,7 @@ TypedScheduler<FloatType>::to_blueprint(Node &data)
   spatial_coords["type"] = "rectilinear";
   spatial_coords["values/x"].set(DataType::float64(image_width + 1));
   spatial_coords["values/y"].set(DataType::float64(image_height + 1));
-  spatial_coords["values/z"].set(DataType::float64(num_channels + 1));
+  spatial_coords["values/z"].set(DataType::float64(num_energy_groups + 1));
 
   float64_array spatial_coords_x = spatial_coords["values/x"].value();
   float64_array spatial_coords_y = spatial_coords["values/y"].value();
@@ -1013,7 +1074,7 @@ TypedScheduler<FloatType>::to_blueprint(Node &data)
     spatial_coords_y[i] = i * spatial_dy;
   }
 
-  for (int i = 0; i <= num_channels; i++)
+  for (int i = 0; i <= num_energy_groups; i++)
   {
     spatial_coords_z[i] = i;
   }  
@@ -1030,15 +1091,6 @@ TypedScheduler<FloatType>::to_blueprint(Node &data)
   Node &spatial_topo = topologies["spatial_topo"];
   spatial_topo["coordset"] = "spatial_coords";
   spatial_topo["type"] = "rectilinear";
-
-  // Fields
-  Node &intensities_spatial = fields["intensities_spatial"];
-  intensities_spatial.set(intensities);
-  intensities_spatial["topology"] = "spatial_topo";
-
-  Node &optical_depth_spatial = fields["optical_depth_spatial"];
-  optical_depth_spatial.set(optical_depth);
-  optical_depth_spatial["topology"] = "spatial_topo";
 
   //
   // Near plane mesh
@@ -1120,12 +1172,10 @@ TypedScheduler<FloatType>::to_blueprint(Node &data)
                               up);
   }
 
-  // } // removing volume renderer
-
   Node verify;
   if (!blueprint::verify("mesh", data, verify))
   {
-    ROVER_ERROR("Error: to_blueprint failed to produce a valid conduit mesh: " << verify.to_yaml());
+    ASCENT_LOG_ERROR("Error: to_blueprint failed to produce a valid conduit mesh: " << verify.to_yaml());
   }
 }
 

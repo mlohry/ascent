@@ -21,7 +21,7 @@
 #include <domain.hpp>
 #include <image.hpp>
 #include <png_utils/ascent_png_encoder.hpp>
-#include <ray_generators/vtkm_ray_generator.hpp>
+#include <ray_generators/ray_generator.hpp>
 #include <rover_exceptions.hpp>
 #include <scheduler.hpp>
 
@@ -83,6 +83,7 @@ public:
 
 protected:
   int                                       m_num_local_domains;
+  bool                                      m_has_emission;
   std::vector<Domain>                       m_domains;
   RayGenerator                             *m_ray_generator;
   std::vector<vtkm::Float64>                m_background;
@@ -93,8 +94,8 @@ protected:
   MPI_Comm                                  m_comm_handle;
 #endif
 
-  void create_background(const int num_channels);
-  int  get_global_channels();
+  void create_background(const int num_energy_groups);
+  int  get_global_num_energy_groups();
   void set_global_range_and_bounds();
   void add_partial(const vtkhRayTracing::PartialComposite<FloatType> &partial);
   void composite();

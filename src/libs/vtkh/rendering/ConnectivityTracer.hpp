@@ -7,6 +7,11 @@
 //  the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR
 //  PURPOSE.  See the above copyright notice for more information.
 //============================================================================
+
+//
+// This code was originally pulled in from Viskores.
+//
+
 #ifndef vtkh_rendering_raytracing_ConnectivityTracer_h
 #define vtkh_rendering_raytracing_ConnectivityTracer_h
 
@@ -79,6 +84,7 @@ public:
     , BumpEpsilon(1e-3)
     , CountRayStatus(false)
     , UnitScalar(1.f)
+    , NumEnergyGroups(1)
   {
   }
 
@@ -102,6 +108,13 @@ public:
                      const vtkm::cont::CoordinateSystem& coords,
                      const vtkm::cont::Field& ghostField);
 
+  // Absporption-only case
+  void SetEnergyData(const vtkm::cont::Field& absorption,
+                     const vtkm::Int32 numBins,
+                     const vtkm::cont::UnknownCellSet& cellSet,
+                     const vtkm::cont::CoordinateSystem& coords);
+
+  // Absorption + Emission case
   void SetEnergyData(const vtkm::cont::Field& absorption,
                      const vtkm::Int32 numBins,
                      const vtkm::cont::UnknownCellSet& cellSet,
@@ -214,6 +227,7 @@ protected:
   bool FieldAssocPoints;
   bool HasEmission; // Mode for integrating through energy bins
   bool DivideEmisByAbsorb;
+  vtkm::Int32 NumEnergyGroups;
 
   // timers
   vtkm::Float64 IntersectTime;

@@ -408,6 +408,7 @@ RoverXRay::verify_params(const conduit::Node &params,
     "camera/fov",
     "camera/look_at",
     "camera/near_plane",
+    "camera/position",
     "camera/up",
     "camera/xpan",
     "camera/ypan",
@@ -500,7 +501,7 @@ RoverXRay::execute()
   
   // Adding a dataset to rover resets the camera bounds to the dataset bounds,
   // but any camera params passed via the input params will take precedence.
-  // It also instantiates a scheduler if one doesn't already exist.
+  // It also instantiates one scheduler per MPI rank if they don't already exist.
   rover.add_dataset(dataset);
 
   // Calling execute initializes everything that rover needs based on the input params
@@ -529,6 +530,8 @@ RoverXRay::execute()
       rover.to_blueprint(data);
     }
 
+    ASCENT_ANNOTATE_MARK_BEGIN("rover filter save blueprint");
+
     const std::string blueprint_filename = output_dir(expand_path_special_variables(
                                                       filename,
                                                       ".root",
@@ -542,6 +545,7 @@ RoverXRay::execute()
                         num_files,
                         extra_opts,
                         result_path);
+    ASCENT_ANNOTATE_MARK_END("rover filter save blueprint");
   }  
   else if ("bov" == output_type)
   {
