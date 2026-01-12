@@ -13,7 +13,7 @@ jobs:
       CXX: clang++
     steps:
     - name: Checkout
-      uses: actions/checkout@v4
+      uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v4
       with:
         submodules: 'recursive'
     - name: Build TPLs
@@ -43,5 +43,5 @@ jobs:
         cd install/examples/ascent/using-with-cmake
         cmake -S . -B build
         cmake --build build --verbose -j2
-        export DYLD_LIBRARY_PATH=/home/runner/work/ascent/ascent/install/vtk-m-v2.0.0/lib/:${DYLD_LIBRARY_PATH}
+        export DYLD_LIBRARY_PATH=/home/runner/work/ascent/ascent/install/viskores-1.0.0/lib/:${DYLD_LIBRARY_PATH}
         ./build/ascent_render_example
